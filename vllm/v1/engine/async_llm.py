@@ -928,6 +928,34 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def get_routed_experts_stats(self) -> list[Any] | None:
+        """Get routed-experts statistics from all DP ranks.
+
+        Returns a list of per-rank snapshots, or ``None`` if stats
+        collection is not enabled. The API server is responsible for
+        aggregating across ranks.
+        """
+        # ``call_utility_async`` on the multi-engine client returns a
+        # list of per-engine results; we forward that as-is so the
+        # caller can aggregate. On the single-engine client it returns
+        # a single snapshot wrapped in a list.
+        results = await self.engine_core.get_routed_experts_stats_async()
+        if results is None:
+            return None
+        # Normalize: single-engine client may return a bare snapshot
+        # or a list with one element depending on the path.
+        if not isinstance(results, list):
+            return [results]
+        return results
+
+    async def reset_routed_experts_stats(self) -> None:
+        """Reset routed-experts statistics on all DP ranks."""
+        await self.engine_core.reset_routed_experts_stats_async()
+
+    async def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
+        """Enable or disable routed-experts stats collection."""
+        await self.engine_core.set_routed_experts_stats_enabled_async(enabled)
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
             await self.renderer.clear_mm_cache_async()

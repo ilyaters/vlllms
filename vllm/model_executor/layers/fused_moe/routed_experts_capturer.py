@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -15,6 +16,11 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.routed_experts_stats_collector import (
+        RoutedExpertsStatsCollector,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +255,21 @@ class RoutedExpertsManager:
         self,
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
+        internal_only: bool = False,
     ) -> None:
+        """Initialize the scheduler-side routed-experts slot buffer.
+
+        Args:
+            vllm_config: The vLLM configuration.
+            kv_cache_config: The KV-cache configuration (used to size
+                the slot buffer to the full block pool).
+            internal_only: If True, the manager is created solely to
+                feed the global stats collector and the per-request
+                ``routed_experts`` field in ``EngineCoreOutput`` is
+                suppressed. Used when
+                ``enable_routed_experts_stats=True`` but
+                ``enable_return_routed_experts=False``.
+        """
         # Pick the attention group for block/slot mapping. We require
         # a FullAttentionSpec group rather than any AttentionSpec to
         # stay consistent with the worker-side lookup in
@@ -285,14 +305,23 @@ class RoutedExpertsManager:
             ),
             dtype=expert_id_dtype,
         )
+        # Optional global stats collector. When set, ``store_batch``
+        # also feeds the collector with the raw routing data.
+        self.stats_collector: RoutedExpertsStatsCollector | None = None
+        # When True, ``get()`` is never called and the per-request
+        # ``routed_experts`` field in ``EngineCoreOutput`` is left as
+        # None. The slot buffer is still maintained so the stats
+        # collector can observe every step.
+        self.internal_only = internal_only
         logger.info(
             "RoutedExpertsManager CPU buffer: %.2f GB "
-            "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
+            "(slots=%d, layers=%d, top_k=%d, dtype=%s, internal_only=%s)",
             self.routed_experts_by_slot.nbytes / 1e9,
             max_num_slots,
             hf_config.num_hidden_layers,
             hf_config.num_experts_per_tok,
             self.routed_experts_by_slot.dtype.name,
+            internal_only,
         )
 
     def store_batch(self, data: np.ndarray, slot_mapping: np.ndarray) -> None:
@@ -301,8 +330,13 @@ class RoutedExpertsManager:
         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
         indexing handles repeated / out-of-order indices. Called once
         per scheduler step in ``update_from_output``.
+
+        If a ``stats_collector`` is attached, the raw ``data`` is also
+        forwarded to it for global aggregation.
         """
         self.routed_experts_by_slot[slot_mapping] = data
+        if self.stats_collector is not None:
+            self.stats_collector.record_batch(data, slot_mapping)
 
     def get(
         self,

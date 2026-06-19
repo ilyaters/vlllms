@@ -213,6 +213,26 @@ class ModelConfig:
     flexibility."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
+    enable_routed_experts_stats: bool = False
+    """Whether to accumulate global expert routing statistics across all
+    requests and expose them via the REST API
+    (``GET /v1/routed-experts/stats``).
+
+    Independent from ``enable_return_routed_experts`` — does NOT
+    require it. When enabled, the scheduler-side
+    :class:`RoutedExpertsStatsCollector` aggregates per-step routing
+    decisions into global counters that can be queried via the API.
+
+    Notes:
+        * Adds a D2H copy of the routing tensor on every step (same
+          overhead as ``enable_return_routed_experts``).
+        * Does NOT return per-request routing data to the client.
+        * Not compatible with expert parallelism (EP > 1).
+        * Compatible with data parallelism (DP > 1) — the API server
+          aggregates across ranks.
+        * Compatible with pipeline parallelism (PP > 1) — each PP
+          stage records into its slice of the global layer space.
+    """
     max_logprobs: int = 20
     """Maximum number of log probabilities to return when `logprobs` is
     specified in `SamplingParams`. The default value comes the default for the

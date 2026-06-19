@@ -704,6 +704,21 @@ class EngineCore:
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
+    def get_routed_experts_stats(self):
+        """Return the current routed-experts stats snapshot.
+
+        Returns ``None`` if stats collection is not enabled.
+        """
+        return self.scheduler.get_routed_experts_stats()
+
+    def reset_routed_experts_stats(self) -> None:
+        """Reset accumulated routed-experts statistics."""
+        self.scheduler.reset_routed_experts_stats()
+
+    def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
+        """Enable or disable routed-experts stats collection."""
+        self.scheduler.set_routed_experts_stats_enabled(enabled)
+
     def _reset_caches(
         self,
         reset_running_requests: bool = True,

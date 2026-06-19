@@ -321,6 +321,15 @@ class InprocClient(EngineCoreClient):
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
 
+    def get_routed_experts_stats(self):
+        return self.engine_core.get_routed_experts_stats()
+
+    def reset_routed_experts_stats(self) -> None:
+        self.engine_core.reset_routed_experts_stats()
+
+    def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
+        self.engine_core.set_routed_experts_stats_enabled(enabled)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
             raise ValueError("'wait' pause mode is not supported in inproc-engine mode")
@@ -908,6 +917,15 @@ class SyncMPClient(MPClient):
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
+    def get_routed_experts_stats(self):
+        return self.call_utility("get_routed_experts_stats")
+
+    def reset_routed_experts_stats(self) -> None:
+        self.call_utility("reset_routed_experts_stats")
+
+    def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
+        self.call_utility("set_routed_experts_stats_enabled", enabled)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1155,6 +1173,17 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
+
+    async def get_routed_experts_stats_async(self):
+        return await self.call_utility_async("get_routed_experts_stats")
+
+    async def reset_routed_experts_stats_async(self) -> None:
+        await self.call_utility_async("reset_routed_experts_stats")
+
+    async def set_routed_experts_stats_enabled_async(self, enabled: bool) -> None:
+        await self.call_utility_async(
+            "set_routed_experts_stats_enabled", enabled
+        )
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)

@@ -304,21 +304,64 @@ class Scheduler(SchedulerInterface):
         self.enable_return_routed_experts = (
             vllm_config.model_config.enable_return_routed_experts
         )
+        self.enable_routed_experts_stats = (
+            vllm_config.model_config.enable_routed_experts_stats
+        )
 
-        if self.enable_return_routed_experts:
+        # The routed-experts manager is needed whenever we either
+        # return per-request routing data to the client OR accumulate
+        # global stats. The ``internal_only`` flag suppresses the
+        # per-request path when only stats are requested.
+        if self.enable_return_routed_experts or self.enable_routed_experts_stats:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
-                "enable_return_routed_experts does not support context parallelism "
+                "enable_return_routed_experts / enable_routed_experts_stats "
+                "do not support context parallelism "
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
+            internal_only = (
+                self.enable_routed_experts_stats
+                and not self.enable_return_routed_experts
+            )
             self.routed_experts_mgr = RoutedExpertsManager(
                 vllm_config=vllm_config,
                 kv_cache_config=kv_cache_config,
+                internal_only=internal_only,
             )
             # Block-ID snapshot taken at schedule time (before forward),
             # so update_from_output can read slot data even if a later
             # schedule() frees the blocks (async scheduling race).
+            # Only needed when per-request routing is returned.
             self._re_block_ids: dict[str, list[int]] = {}
+
+            if self.enable_routed_experts_stats:
+                # Initialize the global stats collector. The collector
+                # is sized for the full model (all layers + all
+                # experts) so that PP stages can record into their
+                # slice via ``layer_offset``.
+                from vllm.v1.core.sched.routed_experts_stats_collector import (
+                    RoutedExpertsStatsCollector,
+                )
+
+                hf_text_config = vllm_config.model_config.hf_text_config
+                num_experts = self._get_num_experts(hf_text_config)
+                num_layers = (
+                    vllm_config.model_config.get_total_num_hidden_layers()
+                )
+                top_k = self._get_top_k(hf_text_config)
+                dp_rank = (
+                    vllm_config.parallel_config.data_parallel_rank
+                    if vllm_config.parallel_config.data_parallel_size > 1
+                    else None
+                )
+                self.routed_experts_mgr.stats_collector = (
+                    RoutedExpertsStatsCollector(
+                        num_experts=num_experts,
+                        num_layers=num_layers,
+                        top_k=top_k,
+                        dp_rank=dp_rank,
+                    )
+                )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -1502,21 +1545,27 @@ class Scheduler(SchedulerInterface):
         # MUST precede the per-request routing reads below: stopped
         # requests may terminate on tokens generated in this very step,
         # whose routing was just D2H'd into model_runner_output.
+        # Also feeds the global stats collector (if attached) via
+        # ``RoutedExpertsManager.store_batch``.
         routing_data = None
         routing_offsets: dict[str, int] = {}
-        if model_runner_output.routed_experts is not None:
+        if (
+            self.routed_experts_mgr is not None
+            and model_runner_output.routed_experts is not None
+        ):
             re = model_runner_output.routed_experts
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
-            routing_data = re.routing_data.astype(
-                self.routed_experts_mgr.routed_experts_by_slot.dtype,
-                copy=False,
-            )
-            # Build offset map using model runner's request order
-            # (input_batch ordering), NOT scheduler dict order.
-            offset = 0
-            for rid in model_runner_output.req_ids:
-                routing_offsets[rid] = offset
-                offset += num_scheduled_tokens[rid]
+            if not self.routed_experts_mgr.internal_only:
+                routing_data = re.routing_data.astype(
+                    self.routed_experts_mgr.routed_experts_by_slot.dtype,
+                    copy=False,
+                )
+                # Build offset map using model runner's request order
+                # (input_batch ordering), NOT scheduler dict order.
+                offset = 0
+                for rid in model_runner_output.req_ids:
+                    routing_offsets[rid] = offset
+                    offset += num_scheduled_tokens[rid]
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -1660,6 +1709,14 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    # Notify the stats collector that a request has
+                    # finished. Only counted when the request actually
+                    # terminates (not when it is preempted and re-queued).
+                    if (
+                        self.routed_experts_mgr is not None
+                        and self.routed_experts_mgr.stats_collector is not None
+                    ):
+                        self.routed_experts_mgr.stats_collector.record_request()
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -2219,6 +2276,73 @@ class Scheduler(SchedulerInterface):
         stale vision embeddings are not reused.
         """
         self.encoder_cache_manager.reset()
+
+    @staticmethod
+    def _get_num_experts(hf_text_config: Any) -> int:
+        """Resolve ``num_experts`` from the HF text config.
+
+        Mirrors the resolution logic in
+        :func:`vllm.model_executor.layers.fused_moe.routed_experts_capturer.get_num_experts`
+        but is duplicated here to avoid an import cycle (the capturer
+        module is imported by the scheduler, not the other way around).
+        """
+        for key in ("num_experts", "n_routed_experts", "num_local_experts"):
+            val = getattr(hf_text_config, key, None)
+            if val is not None:
+                return int(val)
+        return 0
+
+    @staticmethod
+    def _get_top_k(hf_text_config: Any) -> int:
+        """Resolve ``num_experts_per_tok`` (top_k) from the HF text config.
+
+        Mirrors the resolution logic in
+        :func:`vllm.model_executor.layers.fused_moe.routed_experts_capturer._get_num_experts_per_tok`.
+        """
+        val = getattr(hf_text_config, "num_experts_per_tok", None)
+        if val is None:
+            val = getattr(hf_text_config, "top_k_experts", None)
+        if val is None:
+            return 0
+        return int(val)
+
+    def get_routed_experts_stats(self) -> Any:
+        """Return the current routed-experts stats snapshot.
+
+        Returns ``None`` if stats collection is not enabled.
+        """
+        if (
+            not self.enable_routed_experts_stats
+            or self.routed_experts_mgr is None
+            or self.routed_experts_mgr.stats_collector is None
+        ):
+            return None
+        return self.routed_experts_mgr.stats_collector.get_stats()
+
+    def reset_routed_experts_stats(self) -> None:
+        """Reset accumulated routed-experts statistics.
+
+        No-op if stats collection is not enabled.
+        """
+        if (
+            self.routed_experts_mgr is not None
+            and self.routed_experts_mgr.stats_collector is not None
+        ):
+            self.routed_experts_mgr.stats_collector.reset()
+
+    def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
+        """Enable or disable routed-experts stats collection.
+
+        No-op if stats collection is not enabled at startup.
+        """
+        if (
+            self.routed_experts_mgr is not None
+            and self.routed_experts_mgr.stats_collector is not None
+        ):
+            if enabled:
+                self.routed_experts_mgr.stats_collector.enable()
+            else:
+                self.routed_experts_mgr.stats_collector.disable()
 
     def make_stats(
         self,

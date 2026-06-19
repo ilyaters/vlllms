@@ -188,6 +188,14 @@ def build_app(
 
     register_models_api_router(app)
 
+    # Routed-experts stats API (only attached when
+    # --enable-routed-experts-stats is set).
+    from vllm.entrypoints.serve.routed_experts.api_router import (
+        attach_router as attach_routed_experts_router,
+    )
+
+    attach_routed_experts_router(app)
+
     from vllm.entrypoints.serve.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
     )

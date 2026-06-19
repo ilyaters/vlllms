@@ -255,3 +255,26 @@ class EngineClient(ABC):
     async def finish_weight_update(self) -> None:
         """Finish the current weight update."""
         raise NotImplementedError
+
+    async def get_routed_experts_stats(self) -> list[Any] | None:
+        """Get routed-experts statistics from all DP ranks.
+
+        Returns a list of per-rank snapshots, or ``None`` if stats
+        collection is not enabled. The API server is responsible for
+        aggregating across ranks.
+        """
+        raise NotImplementedError
+
+    async def reset_routed_experts_stats(self) -> None:
+        """Reset routed-experts statistics on all DP ranks.
+
+        No-op if stats collection is not enabled.
+        """
+        raise NotImplementedError
+
+    async def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
+        """Enable or disable routed-experts stats collection.
+
+        No-op if stats collection is not enabled at startup.
+        """
+        raise NotImplementedError

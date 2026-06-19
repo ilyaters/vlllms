@@ -895,6 +895,53 @@ class VllmConfig:
                     "connectors (PD disaggregation, KV cache offload)."
                 )
 
+        if (
+            self.model_config is not None
+            and self.model_config.enable_routed_experts_stats
+        ):
+            # Expert parallelism is not supported: each rank only sees
+            # a subset of experts, and the global expert IDs would need
+            # a local→global mapping that is not yet implemented.
+            if self.parallel_config.enable_expert_parallel:
+                raise ValueError(
+                    "--enable-routed-experts-stats is incompatible with "
+                    "expert parallelism (enable_expert_parallel=True)."
+                )
+
+            # Context parallelism (DCP/PCP) is not supported: the
+            # capturer assumes the full per-token routing tensor is
+            # visible on a single rank, which CP breaks.
+            if (
+                self.parallel_config.decode_context_parallel_size > 1
+                or self.parallel_config.prefill_context_parallel_size > 1
+            ):
+                raise ValueError(
+                    "--enable-routed-experts-stats is incompatible with "
+                    "context parallelism (DCP > 1 or PCP > 1)."
+                )
+
+            # Incompatible with KV connectors for the same reason as
+            # enable_return_routed_experts: slot_mapping semantics
+            # change when KV blocks live outside local GPU memory.
+            if (
+                self.kv_transfer_config is not None
+                and self.kv_transfer_config.is_kv_transfer_instance
+            ):
+                raise ValueError(
+                    "--enable-routed-experts-stats is incompatible with KV "
+                    "connectors (PD disaggregation, KV cache offload)."
+                )
+
+            # Only MoE models have routed experts.
+            if not self.model_config.is_moe:
+                logger.warning(
+                    "--enable-routed-experts-stats is set but the model "
+                    "is not an MoE model (num_experts=%d). The stats "
+                    "collector will be initialized but will never "
+                    "accumulate any data.",
+                    self.model_config.get_num_experts(),
+                )
+
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
@@ -1981,6 +2028,7 @@ class VllmConfig:
             f"quantization_config={self.model_config.quantization_config}, "  # noqa
             f"enforce_eager={self.model_config.enforce_eager}, "
             f"enable_return_routed_experts={self.model_config.enable_return_routed_experts}, "  # noqa
+            f"enable_routed_experts_stats={self.model_config.enable_routed_experts_stats}, "  # noqa
             f"kv_cache_dtype={self.cache_config.cache_dtype}, "
             f"device_config={self.device_config.device}, "
             f"structured_outputs_config={self.structured_outputs_config!r}, "
