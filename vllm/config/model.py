@@ -233,6 +233,33 @@ class ModelConfig:
         * Compatible with pipeline parallelism (PP > 1) — each PP
           stage records into its slice of the global layer space.
     """
+    riy_expert_profile: str | None = None
+    """Path to a RIY profile JSON (``{"pruned_experts": [[layer, expert],
+    ...]}`` or ``{"layers": {"<layer>": [expert, ...]}}``).
+
+    At load time, pruned experts are compacted out of the expert map so
+    their weights are never allocated (permanent VRAM savings,
+    quantization-agnostic). Orthogonal to runtime masking via the REST
+    API (``POST /v1/routed-experts/mask``).
+
+    Limitations (validated at startup):
+      * Expert parallelism (EP > 1) is not supported.
+      * Monolithic MoE kernels are not supported (``prune_logit_mask``
+        does not act on the monolithic routing path).
+      * Fused shared experts (ROCm AITER) are not supported.
+      * The MoE kernel must support ``expert_map`` remapping.
+      * Each layer must keep >= ``top_k`` experts.
+    """
+    enable_routed_experts_mask: bool = False
+    """Enable runtime expert masking via the REST API
+    (``POST /v1/routed-experts/mask``) without the full stats pipeline.
+
+    Activates the runtime ``apply_riy_mask`` hook (zero + renormalize
+    masked experts' routing weights) and the mask RPC channel, but does
+    NOT allocate the D2H weight buffer or the numpy stats collector.
+    Third orthogonal mode (besides ``enable_routed_experts_stats`` and
+    ``riy_expert_profile``). Not supported with monolithic MoE kernels.
+    """
     max_logprobs: int = 20
     """Maximum number of log probabilities to return when `logprobs` is
     specified in `SamplingParams`. The default value comes the default for the

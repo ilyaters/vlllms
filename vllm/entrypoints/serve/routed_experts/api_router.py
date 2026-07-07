@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
@@ -33,6 +34,24 @@ router = APIRouter()
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
+
+
+class RiyMaskRequest(BaseModel):
+    """Body for ``POST /v1/routed-experts/mask``."""
+
+    pruned_experts: list[list[int]] = Field(
+        default_factory=list,
+        description=(
+            "List of [layer_idx, expert_idx] pairs whose routing weights "
+            "should be zeroed + renormalized at runtime."
+        ),
+    )
+
+
+class RiyProfileLoadRequest(BaseModel):
+    """Body for ``POST /v1/routed-experts/profile/load``."""
+
+    path: str = Field(..., description="Path to a RIY profile JSON file.")
 
 
 @router.get("/v1/routed-experts/stats")
@@ -114,23 +133,71 @@ async def enable_routed_experts_stats(raw_request: Request):
     )
 
 
-def attach_router(app: FastAPI) -> None:
-    """Attach the routed-experts stats router to the FastAPI app.
+@router.get("/v1/routed-experts/mask")
+async def get_riy_mask(raw_request: Request):
+    """Return the current runtime expert mask as [layer, expert] pairs."""
+    client = engine_client(raw_request)
+    mask = await client.get_riy_mask()
+    return JSONResponse(content={"pruned_experts": mask})
 
-    Only attaches when ``enable_routed_experts_stats=True`` in the
-    model config. Logs a warning when attached so operators know the
-    endpoint is exposed.
+
+@router.post("/v1/routed-experts/mask")
+async def set_riy_mask(raw_request: Request, body: RiyMaskRequest):
+    """Set the runtime expert mask (reversible, no VRAM savings)."""
+    client = engine_client(raw_request)
+    await client.set_riy_mask(body.pruned_experts)
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "pruned_experts": body.pruned_experts,
+        }
+    )
+
+
+@router.delete("/v1/routed-experts/mask")
+async def clear_riy_mask(raw_request: Request):
+    """Clear the runtime expert mask (allow every expert)."""
+    client = engine_client(raw_request)
+    await client.clear_riy_mask()
+    return JSONResponse(content={"status": "ok", "pruned_experts": []})
+
+
+@router.post("/v1/routed-experts/profile/load")
+async def load_riy_profile(raw_request: Request, body: RiyProfileLoadRequest):
+    """Load a RIY profile and apply it (runtime mask at serving time).
+
+    NOTE: permanent VRAM-saving load-time prune requires the
+    ``--riy-expert-profile`` flag at startup. At runtime, this endpoint
+    applies the profile as a reversible runtime mask.
+    """
+    client = engine_client(raw_request)
+    profile = await client.load_riy_profile(body.path)
+    return JSONResponse(content={"status": "ok", "profile": profile})
+
+
+def attach_router(app: FastAPI) -> None:
+    """Attach the routed-experts router to the FastAPI app.
+
+    Attached when ANY of the routed-experts / RIY modes is enabled:
+    ``enable_routed_experts_stats``, ``enable_routed_experts_mask``, or
+    ``riy_expert_profile``. Logs a warning when attached so operators
+    know the endpoints are exposed.
     """
     args = getattr(app.state, "args", None)
     if args is None:
         return
-    if not getattr(args, "enable_routed_experts_stats", False):
+    stats_on = getattr(args, "enable_routed_experts_stats", False)
+    mask_on = getattr(args, "enable_routed_experts_mask", False)
+    profile_on = getattr(args, "riy_expert_profile", None) is not None
+    if not (stats_on or mask_on or profile_on):
         return
 
     logger.warning_once(
-        "Routed-experts stats API is enabled. "
+        "Routed-experts / RIY API is enabled. "
         "Endpoints: GET /v1/routed-experts/stats, "
-        "POST /v1/routed-experts/stats/{reset,disable,enable}. "
+        "POST /v1/routed-experts/stats/{reset,disable,enable}, "
+        "GET/POST/DELETE /v1/routed-experts/mask, "
+        "POST /v1/routed-experts/profile/load. "
         "This should ONLY be used in trusted environments."
     )
     app.include_router(router)

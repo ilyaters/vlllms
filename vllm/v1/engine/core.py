@@ -719,6 +719,40 @@ class EngineCore:
         """Enable or disable routed-experts stats collection."""
         self.scheduler.set_routed_experts_stats_enabled(enabled)
 
+    def set_riy_mask(self, pruned_experts: list[list[int]]) -> None:
+        """Set the runtime expert mask on every worker.
+
+        Delegates to the workers via the executor RPC channel
+        (``collective_rpc`` on ``model_executor``, mirror of
+        ``update_weights`` / ``profile``).
+        """
+        self.model_executor.collective_rpc(
+            "set_riy_mask", args=(pruned_experts,)
+        )
+
+    def get_riy_mask(self) -> list[list[int]]:
+        """Return the current runtime expert mask (driver worker's view)."""
+        out = self.model_executor.collective_rpc("get_riy_mask")
+        if not out:
+            return []
+        return out[0]
+
+    def clear_riy_mask(self) -> None:
+        """Clear the runtime expert mask on every worker."""
+        self.model_executor.collective_rpc("clear_riy_mask")
+
+    def load_riy_profile(self, path: str) -> dict:
+        """Load a RIY profile and apply load-time pruning on every worker."""
+        from vllm.model_executor.layers.fused_moe.riy import load_riy_profile
+
+        profile = load_riy_profile(path)
+        if profile is None:
+            return {"pruned_experts": []}
+        self.model_executor.collective_rpc(
+            "load_riy_profile", args=(path,)
+        )
+        return profile
+
     def _reset_caches(
         self,
         reset_running_requests: bool = True,

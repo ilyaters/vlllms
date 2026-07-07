@@ -192,21 +192,39 @@ class ExpertMapManager:
         enable_eplb: bool,
         num_fused_shared_experts: int = 0,
         rocm_aiter_enabled: bool = False,
+        layer_idx: int | None = None,
+        riy_pruned_experts: set[int] | None = None,
     ):
         """
         Initialize expert map manager.
 
         Args:
             global_num_experts: Total number of experts across all ranks
-            moe_parallel_config: MoE parallel configuration (contains ep_size,
+            moe_parallel_config: MoE parallel config (contains ep_size,
                                  ep_rank, backend flags)
             placement_strategy: Strategy for placing experts ('linear' or 'round_robin')
             num_fused_shared_experts: Number of fused shared experts (for AITER)
             rocm_aiter_enabled: Whether ROCm AITER fusion is enabled
+            layer_idx: Index of this MoE layer (for RIY per-layer profile
+                filtering). ``None`` when not applicable.
+            riy_pruned_experts: Set of global expert ids to prune at load
+                time for THIS layer (already filtered from the RIY profile
+                by the factory). ``None`` or empty disables load-time prune.
         """
         self.global_num_experts = global_num_experts
         self.moe_parallel_config = moe_parallel_config
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.layer_idx = layer_idx
+        # RIY load-time prune: global expert ids removed from this layer.
+        # Preserved on ``self`` so ``update()`` re-applies compaction
+        # idempotently (E17).
+        self._riy_pruned: set[int] = (
+            set(riy_pruned_experts) if riy_pruned_experts else set()
+        )
+        # Additive router_logits mask (float32, -inf on pruned), built in
+        # ``_calculate_expert_maps`` when pruning is active. ``None`` when
+        # no pruning.
+        self._riy_prune_logit_mask: torch.Tensor | None = None
         self.rocm_aiter_enabled = rocm_aiter_enabled
         self.top_k = top_k
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -453,6 +471,42 @@ class ExpertMapManager:
         )
 
         self._local_num_experts += self.num_fused_shared_experts
+
+        # RIY load-time prune (E6/E10/E17). Applied strictly AFTER the
+        # ``+= num_fused_shared_experts`` line above (E10). Build-level
+        # validation (layer.py factory) guarantees:
+        #   * EP == 1 (so ``determine_expert_map`` returned ``None`` map)
+        #   * ``num_fused_shared_experts == 0`` (so the += above was a no-op)
+        #   * at least ``top_k`` experts remain per layer (E13)
+        # E17 (idempotency): always recompute from scratch — assign
+        # ``self._local_num_experts = compact`` (overwrite, not ``-= delta``)
+        # so repeated calls from ``update()`` produce identical results.
+        self._riy_prune_logit_mask = None
+        if self._riy_pruned:
+            from vllm.model_executor.layers.fused_moe.riy import (
+                build_riy_prune_logit_mask,
+                build_riy_prune_map,
+            )
+
+            expert_map, compact = build_riy_prune_map(
+                self.global_num_experts, self._riy_pruned
+            )
+            self._expert_map = expert_map
+            self._local_num_experts = compact
+            self._riy_prune_logit_mask = build_riy_prune_logit_mask(
+                self.global_num_experts, self._riy_pruned
+            )
+
+    @property
+    def riy_prune_logit_mask(self) -> torch.Tensor | None:
+        """Additive ``router_logits`` mask for load-time pruning.
+
+        ``(global_num_experts,)`` float32 tensor with ``0.0`` for kept
+        experts and ``-inf`` for pruned ones. ``None`` when no RIY profile
+        is applied. Built on CPU; the runner casts to the router's dtype
+        and device at bind time (E19).
+        """
+        return self._riy_prune_logit_mask
 
     def _init_routing_tables(
         self,

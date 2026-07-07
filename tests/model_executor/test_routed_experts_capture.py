@@ -38,6 +38,9 @@ def _capturer_with_buffer(
         -1,
         dtype=torch.int32,
     )
+    # Stats-disabled capturer has no weight buffer (E16/R4).
+    c.enable_stats = False
+    c.device_weight_buffer = None
     return c
 
 
@@ -70,8 +73,8 @@ def test_base_router_capture_pre_eplb_mapping():
     router = _make_router()
     captured = []
 
-    def capture_fn(ids):
-        captured.append(ids.clone())
+    def capture_fn(ids, weights):
+        captured.append((ids.clone(), weights.clone()))
 
     router.set_capture_fn(capture_fn)
     topk_weights, topk_ids = router.select_experts(
@@ -81,7 +84,9 @@ def test_base_router_capture_pre_eplb_mapping():
 
     assert topk_weights.shape == topk_ids.shape
     assert len(captured) == 1
-    assert torch.equal(captured[0], torch.tensor([[1, 2], [3, 4]]))
+    cap_ids, cap_weights = captured[0]
+    assert torch.equal(cap_ids, torch.tensor([[1, 2], [3, 4]]))
+    assert torch.equal(cap_weights, torch.ones((2, 2), dtype=torch.float32))
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
 
 
@@ -95,7 +100,7 @@ def test_base_router_capture_with_eplb_enabled():
 
     captured = []
 
-    def capture_fn(ids):
+    def capture_fn(ids, weights):
         captured.append(ids.clone())
 
     router.set_capture_fn(capture_fn)
@@ -126,7 +131,7 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def capture(self, layer_id, topk_ids):
+        def capture(self, layer_id, topk_ids, topk_weights=None):
             self.calls.append((layer_id, topk_ids))
 
     dummy_module = DummyFusedMoE()
@@ -166,7 +171,7 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def capture(self, layer_id, topk_ids):
+        def capture(self, layer_id, topk_ids, topk_weights=None):
             self.calls.append((layer_id, topk_ids))
 
     dummy_module = DummyFusedMoE()

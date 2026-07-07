@@ -416,6 +416,8 @@ class EngineArgs:
     model: str = ModelConfig.model
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
     enable_routed_experts_stats: bool = ModelConfig.enable_routed_experts_stats
+    riy_expert_profile: str | None = ModelConfig.riy_expert_profile
+    enable_routed_experts_mask: bool = ModelConfig.enable_routed_experts_mask
     model_weights: str = ModelConfig.model_weights
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
     tokenizer: str | None = ModelConfig.tokenizer
@@ -830,6 +832,14 @@ class EngineArgs:
         model_group.add_argument(
             "--enable-routed-experts-stats",
             **model_kwargs["enable_routed_experts_stats"],
+        )
+        model_group.add_argument(
+            "--riy-expert-profile",
+            **model_kwargs["riy_expert_profile"],
+        )
+        model_group.add_argument(
+            "--enable-routed-experts-mask",
+            **model_kwargs["enable_routed_experts_mask"],
         )
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
@@ -1609,6 +1619,8 @@ class EngineArgs:
             enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
             enable_routed_experts_stats=self.enable_routed_experts_stats,
+            riy_expert_profile=self.riy_expert_profile,
+            enable_routed_experts_mask=self.enable_routed_experts_mask,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
             use_fp64_gumbel=self.use_fp64_gumbel,

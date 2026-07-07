@@ -458,6 +458,9 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        # Per-worker RIY runtime mask state. Populated by init_riy_mask()
+        # when any RIY mode (stats / runtime mask / load-time prune) is on.
+        self.riy_mask_state = None
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -3652,6 +3655,12 @@ class GPUModelRunner(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
                 )
+                # Weight D2H (stats-only; buffer is None when stats off).
+                wbuf = self.routed_experts_capturer.get_device_weight_buffer()
+                if wbuf is not None and self.routed_experts_weights_cpu is not None:
+                    self.routed_experts_weights_cpu[:total].copy_(
+                        wbuf[:total], non_blocking=True
+                    )
 
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -4628,9 +4637,16 @@ class GPUModelRunner(
                 # synchronized by ``_to_list``'s event.synchronize(), so
                 # the pinned buffers are ready to be wrapped as numpy.
                 total = scheduler_output.total_num_scheduled_tokens
+                wbuf = self.routed_experts_capturer.get_device_weight_buffer()
                 output.routed_experts = RoutedExpertsLists(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+                    weights=(
+                        self.routed_experts_weights_cpu[:total].numpy()
+                        if wbuf is not None
+                        and self.routed_experts_weights_cpu is not None
+                        else None
+                    ),
                 )
             return output
 
@@ -4653,11 +4669,15 @@ class GPUModelRunner(
             if self.routed_experts_initialized:
                 buf = self.routed_experts_capturer.get_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
+                wbuf = self.routed_experts_capturer.get_device_weight_buffer()
                 routed_experts_snapshot = RoutedExpertsTensors(
                     routing_data=buf[:total].clone(),
                     slot_mapping=self.routed_experts_slot_mapping_device[
                         :total
                     ].clone(),
+                    weights=(
+                        wbuf[:total].clone() if wbuf is not None else None
+                    ),
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
@@ -7394,6 +7414,18 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        # Pinned CPU buffer for the weight axis (stats-only; None when
+        # the weight device buffer was not allocated, E16/R4).
+        wbuf = self.routed_experts_capturer.get_device_weight_buffer()
+        if wbuf is not None:
+            self.routed_experts_weights_cpu = torch.empty(
+                wbuf.shape,
+                dtype=wbuf.dtype,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+        else:
+            self.routed_experts_weights_cpu = None
         # ``slot_mapping`` dtype is fixed to int64 by
         # ``block_table.slot_mapping``; we mirror that here.
         max_tokens = self.scheduler_config.max_num_batched_tokens
@@ -7425,10 +7457,115 @@ class GPUModelRunner(
             if isinstance(module, MoERunner) and isinstance(module.router, BaseRouter):
                 layer_id = module.layer_id
 
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
+                def _capture_fn(
+                    topk_ids,
+                    topk_weights=None,
+                    _layer_id=layer_id,
+                    _capturer=capturer,
+                ):
+                    _capturer.capture(_layer_id, topk_ids, topk_weights)
 
                 module.router.set_capture_fn(_capture_fn)
+
+    def init_riy_mask(self) -> None:
+        """Bind RIY runtime mask + load-time prune hooks to every router.
+
+        Decoupled from :meth:`init_routed_experts_capturer` (which is only
+        needed for the stats / return-routed-experts pipelines): the mask
+        and prune hooks are needed for the ``act`` modes
+        (``enable_routed_experts_mask`` and ``riy_expert_profile``).
+
+        The two axes are bound independently:
+          * runtime mask provider + ``RiyMaskState`` — only when
+            ``enable_routed_experts_mask`` is on (avoids per-forward
+            ``apply_riy_mask`` overhead in stats-only mode).
+          * load-time ``prune_logit_mask`` — only when a RIY profile is
+            active (the mask is built by ``ExpertMapManager``).
+
+        E11: MUST run before ``compile_or_warm_up_model`` (CUDA Graph
+        capture) — the pre-allocated mask tensors and the always-executing
+        ``apply_riy_mask`` branch rely on stable addresses established
+        here. ``initialize_from_config`` calls this before warmup.
+        """
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+        from vllm.model_executor.layers.fused_moe.riy import RiyMaskState
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        enable_mask = bool(
+            getattr(self.model_config, "enable_routed_experts_mask", False)
+        )
+
+        # RiyMaskState is only needed for the runtime mask axis.
+        if enable_mask:
+            hf_config = self.model_config.hf_text_config
+            num_experts = getattr(hf_config, "num_experts", None)
+            if num_experts is None:
+                num_experts = getattr(hf_config, "n_routed_experts", None)
+            if num_experts is None:
+                num_experts = getattr(hf_config, "num_local_experts", None)
+            if num_experts is None:
+                logger.warning(
+                    "init_riy_mask: could not determine num_experts from "
+                    "hf_config; skipping RIY runtime mask binding."
+                )
+                return
+            num_layers = hf_config.num_hidden_layers
+            self.riy_mask_state = RiyMaskState(
+                num_experts=num_experts,
+                num_layers=num_layers,
+                device=self.device,
+            )
+
+        state = self.riy_mask_state
+        bound_any = False
+        for module in self.compilation_config.static_forward_context.values():
+            if not (
+                isinstance(module, MoERunner)
+                and isinstance(module.router, BaseRouter)
+            ):
+                continue
+            router = module.router
+
+            # Runtime mask provider (closure over layer_id — E2). Only
+            # bound when runtime masking is enabled, to avoid per-forward
+            # overhead in stats-only / prune-only modes. E11: always
+            # returns a tensor (zero = all-allowed), so the apply_riy_mask
+            # branch always executes uniformly under CUDA Graph.
+            if enable_mask and state is not None:
+                layer_id = module.layer_id
+
+                def _mask_provider(_layer_id=layer_id, _state=state):
+                    return _state.get_mask_tensor(_layer_id)
+
+                router.set_riy_mask_provider(_mask_provider)
+                bound_any = True
+
+            # Load-time prune logits mask (built by ExpertMapManager; None
+            # when no profile). E19: cast to the router's logits dtype AND
+            # device so ``router_logits + mask`` does not promote dtype or
+            # hit a device mismatch.
+            prune_mask = getattr(
+                module.routed_experts.expert_map_manager,
+                "riy_prune_logit_mask",
+                None,
+            )
+            if prune_mask is not None:
+                logits_dtype = getattr(
+                    module.moe_config, "router_logits_dtype", None
+                )
+                if logits_dtype is None:
+                    logits_dtype = torch.float32
+                router.set_prune_logit_mask(
+                    prune_mask.to(dtype=logits_dtype, device=self.device)
+                )
+                bound_any = True
+
+        if not bound_any:
+            # Nothing was bound (e.g. no MoE layers, or flags without
+            # effect). Clear the state so RPC calls fail fast.
+            self.riy_mask_state = None
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

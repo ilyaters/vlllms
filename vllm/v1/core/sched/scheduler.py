@@ -1554,7 +1554,11 @@ class Scheduler(SchedulerInterface):
             and model_runner_output.routed_experts is not None
         ):
             re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
+            self.routed_experts_mgr.store_batch(
+                re.routing_data,
+                weight_data=re.weights,
+                slot_mapping=re.slot_mapping,
+            )
             if not self.routed_experts_mgr.internal_only:
                 routing_data = re.routing_data.astype(
                     self.routed_experts_mgr.routed_experts_by_slot.dtype,

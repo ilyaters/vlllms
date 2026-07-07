@@ -956,6 +956,24 @@ class AsyncLLM(EngineClient):
         """Enable or disable routed-experts stats collection."""
         await self.engine_core.set_routed_experts_stats_enabled_async(enabled)
 
+    async def set_riy_mask(
+        self, pruned_experts: list[list[int]]
+    ) -> None:
+        """Set the runtime expert mask on all workers."""
+        await self.engine_core.set_riy_mask_async(pruned_experts)
+
+    async def get_riy_mask(self) -> list[list[int]]:
+        """Return the current runtime expert mask."""
+        return await self.engine_core.get_riy_mask_async()
+
+    async def clear_riy_mask(self) -> None:
+        """Clear the runtime expert mask on all workers."""
+        await self.engine_core.clear_riy_mask_async()
+
+    async def load_riy_profile(self, path: str) -> dict:
+        """Load a RIY profile and apply load-time pruning."""
+        return await self.engine_core.load_riy_profile_async(path)
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
             await self.renderer.clear_mm_cache_async()

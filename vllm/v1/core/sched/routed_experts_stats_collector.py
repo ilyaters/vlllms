@@ -48,6 +48,15 @@ class ExpertStatsSnapshot:
     load_balance_score: float
     # Optional per-rank metadata for DP aggregation.
     dp_rank: int | None = None
+    # expert_id (int) -> summed routing weight across all layers.
+    # Default-empty for backward compatibility with snapshots produced
+    # before the weight_sum axis existed (and with older DP ranks over
+    # RPC — ``aggregate_snapshots`` / ``snapshot_to_dict`` use ``.get``).
+    expert_weight_sums: dict[int, float] = field(default_factory=dict)
+    # layer_id (int) -> {expert_id (int) -> summed routing weight}
+    layer_expert_weight_sums: dict[int, dict[int, float]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -56,6 +65,8 @@ class _CollectorState:
 
     expert_counts: np.ndarray  # (num_experts,) int64
     layer_expert_counts: np.ndarray  # (num_layers, num_experts) int64
+    expert_weight_sums: np.ndarray  # (num_experts,) float64
+    layer_expert_weight_sums: np.ndarray  # (num_layers, num_experts) float64
     total_tokens: int = 0
     total_requests: int = 0
     enabled: bool = True
@@ -111,11 +122,16 @@ class RoutedExpertsStatsCollector:
             layer_expert_counts=np.zeros(
                 (num_layers, num_experts), dtype=np.int64
             ),
+            expert_weight_sums=np.zeros(num_experts, dtype=np.float64),
+            layer_expert_weight_sums=np.zeros(
+                (num_layers, num_experts), dtype=np.float64
+            ),
         )
 
     def record_batch(
         self,
         routing_data: np.ndarray,
+        weight_data: np.ndarray | None = None,
         slot_mapping: np.ndarray | None = None,
         layer_offset: int = 0,
     ) -> None:
@@ -126,6 +142,12 @@ class RoutedExpertsStatsCollector:
                 ``(num_scheduled_tokens, num_layers, top_k)`` with
                 expert IDs. ``-1`` entries are treated as padding and
                 ignored.
+            weight_data: Optional array of the same shape as
+                ``routing_data`` carrying the routing weights (already
+                cast to float32/float64 on the worker side). When
+                provided, weights are accumulated into
+                ``expert_weight_sums`` / ``layer_expert_weight_sums``
+                alongside the activation counts.
             slot_mapping: Unused; kept for API compatibility with
                 future per-slot stats.
             layer_offset: Offset added to the layer index when writing
@@ -168,6 +190,30 @@ class RoutedExpertsStatsCollector:
             if unique.size > 0:
                 np.add.at(self._state.expert_counts, unique, counts)
 
+            # Global expert weight sums (E12: same in_range guard).
+            if weight_data is not None and weight_data.size == routing_data.size:
+                w_flat = weight_data.ravel().astype(np.float64, copy=False)
+                w_valid_vals = w_flat[valid_mask]
+                # Apply the same in_range mask used for counts so that
+                # bincount does not grow past num_experts (shape-mismatch).
+                if not in_range.all():
+                    # ``valid`` was the pre-clamp array; recompute the
+                    # in-range subset on the valid (>=0) entries.
+                    valid_in_range = valid < self.num_experts
+                    w_valid_ids = valid[valid_in_range]
+                    w_valid_vals = w_valid_vals[valid_in_range]
+                else:
+                    w_valid_ids = valid
+                if w_valid_ids.size > 0:
+                    w_sums = np.bincount(
+                        w_valid_ids,
+                        weights=w_valid_vals,
+                        minlength=self.num_experts,
+                    )
+                    self._state.expert_weight_sums += w_sums.astype(
+                        np.float64, copy=False
+                    )
+
             # Per-layer expert counts. Iterate over layers (still
             # vectorized within each layer).
             num_layers_local = routing_data.shape[1]
@@ -198,6 +244,31 @@ class RoutedExpertsStatsCollector:
                     layer_counts,
                 )
 
+                # Per-layer weight sums (E12: in_range guard).
+                if (
+                    weight_data is not None
+                    and weight_data.size == routing_data.size
+                ):
+                    layer_w = weight_data[:, local_layer_idx, :].ravel().astype(
+                        np.float64, copy=False
+                    )
+                    layer_w_valid = layer_w[layer_data >= 0]
+                    if not in_range.all():
+                        layer_valid_in_range = layer_valid < self.num_experts
+                        layer_w_ids = layer_valid[layer_valid_in_range]
+                        layer_w_valid = layer_w_valid[layer_valid_in_range]
+                    else:
+                        layer_w_ids = layer_valid
+                    if layer_w_ids.size > 0:
+                        layer_w_sums = np.bincount(
+                            layer_w_ids,
+                            weights=layer_w_valid,
+                            minlength=self.num_experts,
+                        )
+                        self._state.layer_expert_weight_sums[
+                            global_layer_idx
+                        ] += layer_w_sums.astype(np.float64, copy=False)
+
             # Count unique tokens (not entries).
             self._state.total_tokens += int(routing_data.shape[0])
 
@@ -220,6 +291,8 @@ class RoutedExpertsStatsCollector:
         with self._lock:
             expert_counts = self._state.expert_counts
             layer_expert_counts = self._state.layer_expert_counts
+            expert_weight_sums = self._state.expert_weight_sums
+            layer_expert_weight_sums = self._state.layer_expert_weight_sums
 
             # Convert numpy arrays to dicts (only non-zero entries for
             # efficiency).
@@ -239,11 +312,29 @@ class RoutedExpertsStatsCollector:
                 if nonzero:
                     layer_expert_counts_dict[layer_idx] = nonzero
 
+            expert_weight_sums_dict: dict[int, float] = {
+                int(i): float(w)
+                for i, w in enumerate(expert_weight_sums)
+                if w != 0.0
+            }
+            layer_expert_weight_sums_dict: dict[int, dict[int, float]] = {}
+            for layer_idx in range(self.num_layers):
+                layer_w = layer_expert_weight_sums[layer_idx]
+                nonzero_w = {
+                    int(i): float(w)
+                    for i, w in enumerate(layer_w)
+                    if w != 0.0
+                }
+                if nonzero_w:
+                    layer_expert_weight_sums_dict[layer_idx] = nonzero_w
+
             return ExpertStatsSnapshot(
                 total_tokens_processed=int(self._state.total_tokens),
                 total_requests_processed=int(self._state.total_requests),
                 expert_activation_counts=expert_counts_dict,
                 layer_expert_activation_counts=layer_expert_counts_dict,
+                expert_weight_sums=expert_weight_sums_dict,
+                layer_expert_weight_sums=layer_expert_weight_sums_dict,
                 top_k=self.top_k,
                 num_layers=self.num_layers,
                 num_experts=self.num_experts,
@@ -279,6 +370,8 @@ class RoutedExpertsStatsCollector:
         with self._lock:
             self._state.expert_counts[:] = 0
             self._state.layer_expert_counts[:] = 0
+            self._state.expert_weight_sums[:] = 0.0
+            self._state.layer_expert_weight_sums[:] = 0.0
             self._state.total_tokens = 0
             self._state.total_requests = 0
 
@@ -331,6 +424,8 @@ def aggregate_snapshots(
             total_requests_processed=0,
             expert_activation_counts={},
             layer_expert_activation_counts={},
+            expert_weight_sums={},
+            layer_expert_weight_sums={},
             top_k=0,
             num_layers=0,
             num_experts=0,
@@ -361,6 +456,22 @@ def aggregate_snapshots(
             for eid, cnt in layer_experts.items():
                 dest[eid] = dest.get(eid, 0) + cnt
 
+    # Aggregate expert weight sums.
+    agg_weight: dict[int, float] = {}
+    for snap in snapshots:
+        weight_sums = _get_snapshot_field(snap, "expert_weight_sums")
+        for eid, w in weight_sums.items():
+            agg_weight[eid] = agg_weight.get(eid, 0.0) + float(w)
+
+    # Aggregate per-layer weight sums.
+    agg_layer_weight: dict[int, dict[int, float]] = {}
+    for snap in snapshots:
+        layer_weight = _get_snapshot_field(snap, "layer_expert_weight_sums")
+        for lid, layer_experts in layer_weight.items():
+            dest = agg_layer_weight.setdefault(lid, {})
+            for eid, w in layer_experts.items():
+                dest[eid] = dest.get(eid, 0.0) + float(w)
+
     total_tokens = sum(
         _get_snapshot_field(s, "total_tokens_processed") for s in snapshots
     )
@@ -385,6 +496,8 @@ def aggregate_snapshots(
         total_requests_processed=total_requests,
         expert_activation_counts=agg_expert,
         layer_expert_activation_counts=agg_layer,
+        expert_weight_sums=agg_weight,
+        layer_expert_weight_sums=agg_layer_weight,
         top_k=top_k,
         num_layers=num_layers,
         num_experts=num_experts,
@@ -427,6 +540,8 @@ def snapshot_to_dict(
         num_layers = snapshot["num_layers"]
         top_k = snapshot["top_k"]
         load_balance = snapshot["load_balance_score"]
+        expert_weight_sums = snapshot.get("expert_weight_sums", {})
+        layer_weight_sums = snapshot.get("layer_expert_weight_sums", {})
     else:
         expert_counts = snapshot.expert_activation_counts
         layer_counts = snapshot.layer_expert_activation_counts
@@ -437,8 +552,11 @@ def snapshot_to_dict(
         num_layers = snapshot.num_layers
         top_k = snapshot.top_k
         load_balance = snapshot.load_balance_score
+        expert_weight_sums = snapshot.expert_weight_sums
+        layer_weight_sums = snapshot.layer_expert_weight_sums
 
     total_activations = sum(expert_counts.values())
+    total_weight_sum = sum(float(w) for w in expert_weight_sums.values())
 
     def _build_sorted(
         items: list[tuple[int, int]],
@@ -460,14 +578,43 @@ def snapshot_to_dict(
             )
         return result
 
+    # E14: weight-sorted lists use a separate denominator (total_weight_sum).
+    def _build_sorted_weighted(
+        items: list[tuple[int, float]],
+        reverse: bool,
+    ) -> list[dict[str, Any]]:
+        if not include_zeros:
+            items = [(eid, w) for eid, w in items if w != 0.0]
+        items.sort(key=lambda x: x[1], reverse=reverse)
+        sliced = items[:limit]
+        result: list[dict[str, Any]] = []
+        for eid, w in sliced:
+            pct = (w / total_weight_sum * 100.0) if total_weight_sum else 0.0
+            result.append(
+                {
+                    "expert_id": eid,
+                    "weight_sum": round(float(w), 6),
+                    "percentage": round(pct, 4),
+                }
+            )
+        return result
+
     expert_items = list(expert_counts.items())
     most = _build_sorted(expert_items, reverse=True)
     least = _build_sorted(expert_items, reverse=False)
+
+    weight_items = list(expert_weight_sums.items())
+    most_weighted = _build_sorted_weighted(weight_items, reverse=True)
+    least_weighted = _build_sorted_weighted(weight_items, reverse=False)
 
     # Convert layer_expert_activation_counts keys to strings for JSON.
     layer_dict: dict[str, dict[str, int]] = {
         str(lid): {str(eid): cnt for eid, cnt in layer.items()}
         for lid, layer in layer_counts.items()
+    }
+    layer_weight_dict: dict[str, dict[str, float]] = {
+        str(lid): {str(eid): round(float(w), 6) for eid, w in layer.items()}
+        for lid, layer in layer_weight_sums.items()
     }
 
     return {
@@ -483,6 +630,13 @@ def snapshot_to_dict(
             for eid, cnt in expert_counts.items()
         },
         "layer_expert_activation_counts": layer_dict,
+        "expert_weight_sums": {
+            str(eid): round(float(w), 6)
+            for eid, w in expert_weight_sums.items()
+        },
+        "layer_expert_weight_sums": layer_weight_dict,
         "most_activated_experts": most,
         "least_activated_experts": least,
+        "most_weighted_experts": most_weighted,
+        "least_weighted_experts": least_weighted,
     }

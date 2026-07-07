@@ -31,6 +31,13 @@ from vllm.model_executor.layers.fused_moe.routed_experts import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
 )
+from vllm.model_executor.layers.fused_moe.riy import (
+    RiyMaskState,
+    apply_riy_mask,
+    build_riy_prune_logit_mask,
+    build_riy_prune_map,
+    load_riy_profile,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -79,12 +86,17 @@ __all__ = [
     "MoERunner",
     "RoutingMethodType",
     "RoutedExperts",
+    "RiyMaskState",
     "SharedExperts",
     "activation_without_mul",
     "apply_moe_activation",
+    "apply_riy_mask",
+    "build_riy_prune_logit_mask",
+    "build_riy_prune_map",
     "fused_moe_make_expert_params_mapping",
-    "override_config",
     "get_config",
+    "load_riy_profile",
+    "override_config",
 ]
 
 if HAS_TRITON:

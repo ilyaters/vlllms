@@ -330,6 +330,18 @@ class InprocClient(EngineCoreClient):
     def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
         self.engine_core.set_routed_experts_stats_enabled(enabled)
 
+    def set_riy_mask(self, pruned_experts: list[list[int]]) -> None:
+        self.engine_core.set_riy_mask(pruned_experts)
+
+    def get_riy_mask(self) -> list[list[int]]:
+        return self.engine_core.get_riy_mask()
+
+    def clear_riy_mask(self) -> None:
+        self.engine_core.clear_riy_mask()
+
+    def load_riy_profile(self, path: str) -> dict:
+        return self.engine_core.load_riy_profile(path)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
             raise ValueError("'wait' pause mode is not supported in inproc-engine mode")
@@ -926,6 +938,18 @@ class SyncMPClient(MPClient):
     def set_routed_experts_stats_enabled(self, enabled: bool) -> None:
         self.call_utility("set_routed_experts_stats_enabled", enabled)
 
+    def set_riy_mask(self, pruned_experts: list[list[int]]) -> None:
+        self.call_utility("set_riy_mask", pruned_experts)
+
+    def get_riy_mask(self) -> list[list[int]]:
+        return self.call_utility("get_riy_mask")
+
+    def clear_riy_mask(self) -> None:
+        self.call_utility("clear_riy_mask")
+
+    def load_riy_profile(self, path: str) -> dict:
+        return self.call_utility("load_riy_profile", path)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1184,6 +1208,20 @@ class AsyncMPClient(MPClient):
         await self.call_utility_async(
             "set_routed_experts_stats_enabled", enabled
         )
+
+    async def set_riy_mask_async(
+        self, pruned_experts: list[list[int]]
+    ) -> None:
+        await self.call_utility_async("set_riy_mask", pruned_experts)
+
+    async def get_riy_mask_async(self) -> list[list[int]]:
+        return await self.call_utility_async("get_riy_mask")
+
+    async def clear_riy_mask_async(self) -> None:
+        await self.call_utility_async("clear_riy_mask")
+
+    async def load_riy_profile_async(self, path: str) -> dict:
+        return await self.call_utility_async("load_riy_profile", path)
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)

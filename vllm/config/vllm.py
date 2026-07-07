@@ -942,6 +942,51 @@ class VllmConfig:
                     self.model_config.get_num_experts(),
                 )
 
+        # ------------------------------------------------------------------
+        # RIY: runtime mask + load-time prune config validation.
+        # ------------------------------------------------------------------
+        if self.model_config is not None and (
+            self.model_config.riy_expert_profile
+            or self.model_config.enable_routed_experts_mask
+        ):
+            if not self.model_config.is_moe:
+                raise ValueError(
+                    "RIY expert masking/pruning requires an MoE model."
+                )
+
+        if self.model_config is not None and (
+            self.model_config.riy_expert_profile
+        ):
+            # Load-time prune compacts the expert map; EP>1 has no
+            # stable local->global mapping for compaction.
+            if self.parallel_config.enable_expert_parallel:
+                raise ValueError(
+                    "--riy-expert-profile is incompatible with expert "
+                    "parallelism (enable_expert_parallel=True)."
+                )
+            # EPLB replication composes poorly with compaction.
+            if self.parallel_config.enable_eplb:
+                raise ValueError(
+                    "--riy-expert-profile is incompatible with EPLB "
+                    "(enable_eplb=True)."
+                )
+            # Per-layer runtime checks (monolithic kernel, grouped topk,
+            # fused shared experts, kernel expert_map support, >= top_k
+            # remaining) are performed at model-build time in the MoE
+            # factory where those values are known.
+
+        if (
+            self.model_config is not None
+            and self.model_config.enable_routed_experts_mask
+        ):
+            # Runtime mask works in logical space; EP>1 local->global
+            # mapping for masking is not implemented.
+            if self.parallel_config.enable_expert_parallel:
+                raise ValueError(
+                    "--enable-routed-experts-mask is incompatible with "
+                    "expert parallelism (enable_expert_parallel=True)."
+                )
+
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 

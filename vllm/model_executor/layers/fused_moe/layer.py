@@ -249,6 +249,71 @@ def FusedMoE(
 
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
+    # RIY load-time prune: load the profile once (cached) and filter to
+    # this layer. ``layer_idx`` is derived from ``layer_name`` via the
+    # SAME helper the runner uses for ``MoERunner.layer_id`` (R-layer-idx-
+    # parse / E5 consistency).
+    riy_profile_path = getattr(vllm_config.model_config, "riy_expert_profile", None)
+    riy_pruned_for_layer: set[int] = set()
+    riy_layer_idx: int | None = None
+    if riy_profile_path:
+        from vllm.model_executor.layers.fused_moe.riy import (
+            load_riy_profile,
+            pruned_experts_for_layer,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        riy_profile = load_riy_profile(riy_profile_path)
+        try:
+            riy_layer_idx = extract_layer_index(layer_name)
+        except Exception:
+            logger.warning(
+                "RIY: could not parse layer_idx from layer_name '%s'; "
+                "load-time prune disabled for this layer.",
+                layer_name,
+            )
+            riy_layer_idx = None
+        if riy_layer_idx is not None:
+            riy_pruned_for_layer = pruned_experts_for_layer(
+                riy_profile, riy_layer_idx
+            )
+
+    # Build-level validations that don't need the quant method.
+    if riy_pruned_for_layer:
+        # E13: must keep >= top_k experts per layer.
+        kept = global_num_experts - len(riy_pruned_for_layer)
+        if kept < top_k:
+            raise ValueError(
+                f"RIY profile for layer '{layer_name}' (idx={riy_layer_idx}) "
+                f"prunes {len(riy_pruned_for_layer)} of {global_num_experts} "
+                f"experts, leaving {kept} < top_k={top_k}. Each layer must "
+                f"keep at least top_k experts."
+            )
+        # E10: fused shared experts (ROCm AITER) break compaction.
+        if num_fused_shared_experts > 0:
+            raise ValueError(
+                f"RIY load-time prune is incompatible with fused shared "
+                f"experts (num_fused_shared_experts={num_fused_shared_experts}) "
+                f"on layer '{layer_name}'."
+            )
+        # R-grouped: a fully-pruned expert group would NaN softmax under
+        # grouped top-k. ``num_expert_group``/``topk_group`` are the proxy.
+        if use_grouped_topk and num_expert_group and num_expert_group > 0:
+            group_size = global_num_experts // num_expert_group
+            if group_size > 0:
+                for g in range(num_expert_group):
+                    group_ids = set(
+                        range(g * group_size, (g + 1) * group_size)
+                    )
+                    if group_ids.issubset(riy_pruned_for_layer):
+                        raise ValueError(
+                            f"RIY profile for layer '{layer_name}' fully "
+                            f"prunes expert group {g} under grouped top-k "
+                            f"({num_expert_group} groups), which would "
+                            f"produce NaN in softmax. Keep >=1 expert per "
+                            f"group."
+                        )
+
     # Create ExpertMapManager to handle expert mapping and placement for EP.
     # See ExpertMapManager for a detailed description of what it does and when
     # it is required.
@@ -263,6 +328,8 @@ def FusedMoE(
         enable_eplb=eplb_state is not None,
         num_fused_shared_experts=num_fused_shared_experts,
         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
+        layer_idx=riy_layer_idx,
+        riy_pruned_experts=riy_pruned_for_layer,
     )
 
     # TODO(bnell): we should not have to create a router if the kernel is
@@ -364,6 +431,51 @@ def FusedMoE(
         apply_router_weight_on_input=apply_router_weight_on_input,
         **routed_experts_args if routed_experts_args is not None else {},
     )
+
+    # RIY build-level validations that need the quant method (E9/E20,
+    # R-kernel-ignore). The prune already compacted the expert map in
+    # ExpertMapManager; if these checks fail we raise now (build-time
+    # fail-fast, before serving).
+    if riy_pruned_for_layer:
+        quant_method = routed_experts.quant_method
+        # Unwrap the modular wrapper to inspect the underlying method.
+        underlying = getattr(quant_method, "old_quant_method", quant_method)
+        is_monolithic = bool(getattr(quant_method, "is_monolithic", False))
+        if is_monolithic:
+            raise ValueError(
+                f"RIY load-time prune is incompatible with monolithic MoE "
+                f"kernel '{quant_method.__class__.__name__}' on layer "
+                f"'{layer_name}'. The monolithic routing path does not "
+                f"honor prune_logit_mask; use --enable-routed-experts-mask "
+                f"only, or a modular kernel."
+            )
+        # R-kernel-ignore: the kernel must remap global->local via
+        # expert_map, otherwise compacted weights get indexed by global
+        # ids and crash. The ExpertMapManager docstring enumerates the
+        # supporting kernels; we check the method name against that list.
+        _RIY_EXPERT_MAP_METHODS = {
+            "FusedMoEMethod",
+            "Fp8MoEMethod",
+            "Fp4MoEMethod",
+            "Fp6MoEMethod",
+            "MarlinMoEMethod",
+            "FusedMarlinMoEMethod",
+            "DeepGemmMoEMethod",
+            "GptOssTritonKernelsMoEMethod",
+            "AiterFusedMoEMethod",
+            "XpuMoEMethod",
+            "UnquantizedFusedMoEMethod",
+        }
+        method_name = underlying.__class__.__name__
+        if method_name not in _RIY_EXPERT_MAP_METHODS:
+            raise ValueError(
+                f"RIY load-time prune requires a MoE kernel that supports "
+                f"expert_map remapping, but layer '{layer_name}' uses "
+                f"'{method_name}' which ignores expert_map. Compact weights "
+                f"would be indexed out-of-range. Use a supported kernel or "
+                f"fall back to runtime masking (--enable-routed-experts-"
+                f"mask)."
+            )
 
     if runner_cls is None:
         runner_cls = MoERunner

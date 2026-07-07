@@ -502,3 +502,135 @@ class TestSnapshotToDict:
         # Layer keys should be strings
         assert "0" in result["layer_expert_activation_counts"]
         assert "1" in result["layer_expert_activation_counts"]
+
+
+class TestWeightSums:
+    """Tests for the weight_sum aggregation axis."""
+
+    def test_record_batch_with_weights(self):
+        collector = RoutedExpertsStatsCollector(
+            num_experts=4, num_layers=2, top_k=2
+        )
+        routing = np.array([[[0, 1], [2, 3]]], dtype=np.int64)
+        weights = np.array(
+            [[[0.5, 0.5], [0.25, 0.75]]], dtype=np.float32
+        )
+        collector.record_batch(routing, weight_data=weights)
+
+        stats = collector.get_stats()
+        assert stats.expert_weight_sums[0] == pytest.approx(0.5)
+        assert stats.expert_weight_sums[1] == pytest.approx(0.5)
+        assert stats.expert_weight_sums[2] == pytest.approx(0.25)
+        assert stats.expert_weight_sums[3] == pytest.approx(0.75)
+        # Per-layer
+        assert stats.layer_expert_weight_sums[0][0] == pytest.approx(0.5)
+        assert stats.layer_expert_weight_sums[1][3] == pytest.approx(0.75)
+
+    def test_record_batch_weights_none(self):
+        """No weight_data -> weight sums stay empty, counts still work."""
+        collector = RoutedExpertsStatsCollector(
+            num_experts=4, num_layers=1, top_k=2
+        )
+        collector.record_batch(np.array([[[0, 1]]], dtype=np.int64))
+        stats = collector.get_stats()
+        assert stats.expert_weight_sums == {}
+        assert stats.expert_activation_counts[0] == 1
+
+    def test_record_batch_weights_out_of_range(self):
+        """E12: out-of-range ids must not grow the bincount past num_experts."""
+        collector = RoutedExpertsStatsCollector(
+            num_experts=4, num_layers=1, top_k=2
+        )
+        routing = np.array([[[0, 99]]], dtype=np.int64)
+        weights = np.array([[[0.5, 0.5]]], dtype=np.float32)
+        # Must not raise (shape-mismatch guard).
+        collector.record_batch(routing, weight_data=weights)
+        stats = collector.get_stats()
+        assert stats.expert_weight_sums[0] == pytest.approx(0.5)
+        assert 99 not in stats.expert_weight_sums
+
+    def test_reset_clears_weights(self):
+        collector = RoutedExpertsStatsCollector(
+            num_experts=4, num_layers=1, top_k=2
+        )
+        collector.record_batch(
+            np.array([[[0, 1]]], dtype=np.int64),
+            weight_data=np.array([[[0.5, 0.5]]], dtype=np.float32),
+        )
+        collector.reset()
+        stats = collector.get_stats()
+        assert stats.expert_weight_sums == {}
+        assert stats.layer_expert_weight_sums == {}
+
+    def test_aggregate_weights_across_ranks(self):
+        snapshots = [
+            ExpertStatsSnapshot(
+                total_tokens_processed=10,
+                total_requests_processed=1,
+                expert_activation_counts={0: 1},
+                layer_expert_activation_counts={},
+                top_k=1,
+                num_layers=1,
+                num_experts=4,
+                is_collecting=True,
+                load_balance_score=1.0,
+                expert_weight_sums={0: 0.5},
+            ),
+            ExpertStatsSnapshot(
+                total_tokens_processed=10,
+                total_requests_processed=1,
+                expert_activation_counts={0: 1},
+                layer_expert_activation_counts={},
+                top_k=1,
+                num_layers=1,
+                num_experts=4,
+                is_collecting=True,
+                load_balance_score=1.0,
+                expert_weight_sums={0: 0.25, 1: 0.1},
+            ),
+        ]
+        result = aggregate_snapshots(snapshots)
+        assert result.expert_weight_sums[0] == pytest.approx(0.75)
+        assert result.expert_weight_sums[1] == pytest.approx(0.1)
+
+    def test_snapshot_to_dict_weight_fields(self):
+        """E14: weight-sorted lists use a separate denominator."""
+        snapshot = ExpertStatsSnapshot(
+            total_tokens_processed=10,
+            total_requests_processed=1,
+            expert_activation_counts={0: 5, 1: 5},
+            layer_expert_activation_counts={},
+            top_k=2,
+            num_layers=1,
+            num_experts=4,
+            is_collecting=True,
+            load_balance_score=1.0,
+            expert_weight_sums={0: 0.8, 1: 0.2},
+        )
+        d = snapshot_to_dict(snapshot, limit=2)
+        assert "expert_weight_sums" in d
+        assert d["expert_weight_sums"]["0"] == pytest.approx(0.8)
+        # most_weighted: expert 0 (0.8) first; percentage = 0.8/1.0 = 80
+        assert d["most_weighted_experts"][0]["expert_id"] == 0
+        assert d["most_weighted_experts"][0]["percentage"] == pytest.approx(
+            80.0
+        )
+        assert d["least_weighted_experts"][0]["expert_id"] == 1
+
+    def test_snapshot_to_dict_no_weights(self):
+        """Backward compat: snapshot without weights serializes cleanly."""
+        snapshot = ExpertStatsSnapshot(
+            total_tokens_processed=10,
+            total_requests_processed=1,
+            expert_activation_counts={0: 5},
+            layer_expert_activation_counts={},
+            top_k=1,
+            num_layers=1,
+            num_experts=4,
+            is_collecting=True,
+            load_balance_score=1.0,
+        )
+        d = snapshot_to_dict(snapshot)
+        assert d["expert_weight_sums"] == {}
+        assert d["most_weighted_experts"] == []
+        assert d["least_weighted_experts"] == []

@@ -159,11 +159,51 @@ class BaseRouter(FusedMoERouter):
         super().__init__(eplb_state=eplb_state)
         self.top_k = top_k
         self.global_num_experts = global_num_experts
-        self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+        # RIY runtime mask: a zero-arg callable closed over the layer id
+        # that returns the per-layer boolean mask tensor (True = pruned).
+        # Bound by ``GPUModelRunner.init_riy_mask`` via a closure (E2: the
+        # router itself does not know its layer id). ``None`` disables the
+        # runtime mask branch entirely.
+        self.riy_mask_provider: Callable[[], torch.Tensor] | None = None
+        # RIY load-time prune: an additive ``router_logits`` mask
+        # ( ``(global_num_experts,)`` float, ``-inf`` on pruned), bound
+        # once at build time. ``None`` disables the prune branch.
+        self.prune_logit_mask: torch.Tensor | None = None
 
-    def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
-        """Set a capture callback for logical routed expert IDs."""
+    def set_capture_fn(
+        self,
+        capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None,
+    ) -> None:
+        """Set a capture callback for logical routed expert IDs.
+
+        The callback receives ``(topk_ids, topk_weights)`` so the stats
+        pipeline can aggregate both activation counts and weight sums.
+        """
         self.capture_fn = capture_fn
+
+    def set_riy_mask_provider(
+        self,
+        provider: Callable[[], torch.Tensor] | None,
+    ) -> None:
+        """Bind a runtime mask provider (closed over the layer id).
+
+        The provider takes no arguments and returns a ``(num_experts,)``
+        boolean tensor (True = masked) on the router's device. When set,
+        :meth:`_select_experts` zeros+renormalizes the routing weights of
+        masked experts after capture and before EPLB mapping.
+        """
+        self.riy_mask_provider = provider
+
+    def set_prune_logit_mask(self, mask: torch.Tensor | None) -> None:
+        """Bind the load-time prune logits mask.
+
+        ``mask`` is ``(global_num_experts,)`` with ``-inf`` on pruned
+        experts, already cast to ``router_logits.dtype`` and device (E19).
+        When set, :meth:`_select_experts` adds it to ``router_logits``
+        before routing so pruned experts can never be selected.
+        """
+        self.prune_logit_mask = mask
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -260,14 +300,35 @@ class BaseRouter(FusedMoERouter):
         # Step 1: Validate EPLB state
         self._validate_eplb_state()
 
+        # RIY load-time prune: suppress pruned experts at the logit level
+        # so they can never be selected by top-k. Applied BEFORE routing
+        # (single point — ``_compute_routing`` is polymorphic across
+        # FusedTopkRouter / GroupedTopkRouter / ...). E19: mask is already
+        # cast to router_logits.dtype/device at bind time.
+        if self.prune_logit_mask is not None:
+            router_logits = router_logits + self.prune_logit_mask
+
         # Step 2: Compute routing (delegated to subclass)
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
 
-        # Capture logical ids before EPLB mapping.
+        # Capture logical ids (and weights) before EPLB mapping / masking.
+        # Captures the *raw* routing decision so a masked expert still
+        # accrues stats (otherwise it could never be un-masked again).
         if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
+            self.capture_fn(topk_ids, topk_weights)
+
+        # RIY runtime mask: zero+renormalize masked experts' weights. Runs
+        # in logical space (before EPLB), symmetric with capture. E11: the
+        # provider always returns a tensor (zero = all-allowed), so this
+        # branch always executes uniformly under CUDA Graph. E18: all-masked
+        # rows are left as zeros instead of NaN.
+        if self.riy_mask_provider is not None:
+            from vllm.model_executor.layers.fused_moe.riy import apply_riy_mask
+
+            mt = self.riy_mask_provider()
+            topk_weights = apply_riy_mask(topk_weights, topk_ids, mt)
 
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

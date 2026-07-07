@@ -583,6 +583,15 @@ class Worker(WorkerBase):
         ):
             self.model_runner.init_routed_experts_capturer()
 
+        # RIY mask/prune hooks: needed for the ``act`` modes (runtime mask
+        # and load-time prune), NOT for stats-only. Must run BEFORE
+        # compile_or_warm_up_model (CUDA Graph capture) — E11: the
+        # pre-allocated mask tensors rely on stable addresses.
+        if getattr(self.model_config, "enable_routed_experts_mask", False) or (
+            getattr(self.model_config, "riy_expert_profile", None) is not None
+        ):
+            self.model_runner.init_riy_mask()
+
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
@@ -1140,6 +1149,50 @@ class Worker(WorkerBase):
 
         self._weight_update_active = False
         self._is_checkpoint_format = True
+
+    # ------------------------------------------------------------------
+    # RIY runtime expert masking (RPC-driven, reversible).
+    # ------------------------------------------------------------------
+
+    def _riy_state(self):
+        state = getattr(self.model_runner, "riy_mask_state", None)
+        if state is None:
+            raise RuntimeError(
+                "RIY runtime masking is not initialized. Start the server "
+                "with --enable-routed-experts-mask (or --enable-routed-"
+                "experts-stats / --riy-expert-profile)."
+            )
+        return state
+
+    def set_riy_mask(self, pruned_experts: list[list[int]]) -> None:
+        """Set the runtime expert mask (reversible, no VRAM savings)."""
+        self._riy_state().set_mask(pruned_experts)
+
+    def get_riy_mask(self) -> list[list[int]]:
+        """Return the current runtime expert mask."""
+        return self._riy_state().get_mask()
+
+    def clear_riy_mask(self) -> None:
+        """Clear the runtime expert mask (allow every expert)."""
+        self._riy_state().clear_mask()
+
+    def load_riy_profile(self, path: str) -> dict:
+        """Load a RIY profile and apply it as a **runtime** mask.
+
+        NOTE: permanent load-time pruning (VRAM savings) requires the
+        ``--riy-expert-profile`` flag at startup — it compacts the expert
+        map before weight allocation and cannot be applied post-init.
+        At runtime, ``load_riy_profile`` applies the profile's pruned
+        experts as a reversible runtime mask (same effect as
+        :meth:`set_riy_mask` with the profile's pairs).
+        """
+        from vllm.model_executor.layers.fused_moe.riy import load_riy_profile
+
+        profile = load_riy_profile(path)
+        if profile is None:
+            return {"pruned_experts": []}
+        self._riy_state().set_mask(profile["pruned_experts"])
+        return profile
 
     def shutdown(self) -> None:
         gc.unfreeze()

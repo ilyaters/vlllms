@@ -131,6 +131,10 @@ class RoutedExpertsTensors(NamedTuple):
     routing_data: torch.Tensor
     # (num_scheduled_tokens,)
     slot_mapping: torch.Tensor
+    # Optional routing weights, same shape as ``routing_data`` (float32).
+    # ``None`` when the stats pipeline is off (E16: weight buffer is only
+    # allocated for ``enable_routed_experts_stats``).
+    weights: torch.Tensor | None = None
 
     def to_cpu_nonblocking(self) -> "RoutedExpertsTensors":
         """Issue non-blocking D2H on the current stream.
@@ -146,6 +150,11 @@ class RoutedExpertsTensors(NamedTuple):
         return RoutedExpertsTensors(
             self.routing_data.to("cpu", non_blocking=True),
             self.slot_mapping.to("cpu", non_blocking=True),
+            (
+                self.weights.to("cpu", non_blocking=True)
+                if self.weights is not None
+                else None
+            ),
         )
 
     def tolists(self) -> "RoutedExpertsLists":
@@ -158,6 +167,11 @@ class RoutedExpertsTensors(NamedTuple):
         return RoutedExpertsLists(
             self.routing_data.cpu().numpy(),
             self.slot_mapping.cpu().numpy(),
+            (
+                self.weights.cpu().numpy()
+                if self.weights is not None
+                else None
+            ),
         )
 
 
@@ -175,6 +189,9 @@ class RoutedExpertsLists(NamedTuple):
     routing_data: np.ndarray
     # (num_scheduled_tokens,)
     slot_mapping: np.ndarray
+    # Optional routing weights, same shape as ``routing_data`` (float32).
+    # ``None`` when the stats pipeline is off (E16).
+    weights: np.ndarray | None = None
 
 
 # [num_reqs, <dynamic>]

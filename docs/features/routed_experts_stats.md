@@ -187,3 +187,12 @@ The feature consists of the following components:
 - **API Router**: Exposes REST endpoints for stats access
 
 Statistics are collected per-scheduler-step using numpy vectorization for minimal overhead (<1ms per step for typical batch sizes).
+
+## Weight sums
+
+In addition to activation counts, the collector aggregates **routing weight
+sums** per expert (`expert_weight_sums`, `layer_expert_weight_sums`) and
+exposes `most_weighted_experts` / `least_weighted_experts` lists. Use the two
+axes together to find specialists (rare + high weight) and prune candidates
+(rare + low weight). See [RIY — Expert Masking & Pruning](riy.md) for the
+`act` modes (runtime mask + load-time prune) built on this telemetry.

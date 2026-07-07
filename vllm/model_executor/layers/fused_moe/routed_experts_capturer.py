@@ -112,8 +112,31 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # Weight buffer is only needed for the stats pipeline (weight_sum
+        # aggregation). When only ``enable_return_routed_experts`` is on,
+        # weights are never copied D2H (R4 / E16) — saves memory.
+        self.enable_stats = bool(
+            vllm_config.model_config.enable_routed_experts_stats
+        )
+        if self.enable_stats:
+            self.device_weight_buffer = torch.zeros(
+                (
+                    max_num_batched_tokens,
+                    hf_config.num_hidden_layers,
+                    num_experts_per_tok,
+                ),
+                dtype=torch.float32,
+                device=current_platform.device_type,
+            )
+        else:
+            self.device_weight_buffer = None
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+    ) -> None:
         """Capture expert routing decisions for a specific layer.
 
         Under data parallelism, ``topk_ids`` may have three different batch
@@ -139,6 +162,11 @@ class RoutedExpertsCapturer:
         Args:
             layer_id: The layer index.
             topk_ids: Tensor of shape (batch_size, num_routed_experts).
+            topk_weights: Optional tensor of the same batch shape as
+                ``topk_ids`` carrying the routing weights. Only captured
+                when the stats pipeline is enabled (``device_weight_buffer``
+                is allocated). Cast bfloat16 -> float32 here so D2H/numpy
+                never see bfloat16 (m1).
         """
 
         ctx = get_forward_context()
@@ -186,6 +214,15 @@ class RoutedExpertsCapturer:
                 # downstream ``device_buffer[...] = topk_ids[...]``
                 # setitem narrows into int32 automatically.
                 topk_ids = get_tp_group().all_gather(topk_ids, dim=0)
+                # M5: parallel all-gather for weights on the SP path
+                # (doubles comm cost on SP, but weights are small).
+                if (
+                    topk_weights is not None
+                    and self.device_weight_buffer is not None
+                ):
+                    topk_weights = get_tp_group().all_gather(
+                        topk_weights, dim=0
+                    )
                 start_loc = 0
                 end_loc = token_num_per_dp
             else:
@@ -210,12 +247,24 @@ class RoutedExpertsCapturer:
             start_loc:end_loc, :
         ]
 
+        # Weight capture (stats-only). Cast bfloat16 -> float32 here so
+        # D2H / numpy never see bfloat16 (m1).
+        if (
+            topk_weights is not None
+            and self.device_weight_buffer is not None
+        ):
+            self.device_weight_buffer[:token_num_per_dp, layer_id, :] = (
+                topk_weights[start_loc:end_loc, :].to(torch.float32)
+            )
+
     def clear_buffer(self) -> None:
-        """Zero the device buffer. Called at the start of every step so
+        """Zero the device buffer(s). Called at the start of every step so
         slots belonging to finished / preempted tokens don't leak into
         the next step.
         """
         self.device_buffer.zero_()
+        if self.device_weight_buffer is not None:
+            self.device_weight_buffer.zero_()
 
     def get_device_buffer(self) -> torch.Tensor:
         """Return the underlying device buffer so the model runner can
@@ -224,6 +273,14 @@ class RoutedExpertsCapturer:
         :meth:`clear_buffer`.
         """
         return self.device_buffer
+
+    def get_device_weight_buffer(self) -> torch.Tensor | None:
+        """Return the device weight buffer (or None when stats is off).
+
+        Mirrors :meth:`get_device_buffer` for the weight axis. ``None``
+        when the stats pipeline is disabled — callers must guard.
+        """
+        return self.device_weight_buffer
 
 
 class RoutedExpertsManager:
@@ -305,6 +362,16 @@ class RoutedExpertsManager:
             ),
             dtype=expert_id_dtype,
         )
+        # Weight slot buffer mirrors the ids slot buffer but in float32.
+        # NOTE: per-request weight return to the API client is not wired
+        # (it would be an API-breaking change to ``EngineCoreOutput``).
+        # The stats pipeline consumes weights directly via
+        # ``store_batch(weight_data=...)`` -> ``record_batch`` — it does
+        # NOT need a persisted slot buffer. We therefore keep this as
+        # ``None`` to avoid allocating GBs of unused float32 (the ids slot
+        # buffer is already sized for the whole block pool). A future
+        # per-request weight-return feature can populate this lazily.
+        self.routed_experts_weights_by_slot: np.ndarray | None = None
         # Optional global stats collector. When set, ``store_batch``
         # also feeds the collector with the raw routing data.
         self.stats_collector: RoutedExpertsStatsCollector | None = None
@@ -324,19 +391,32 @@ class RoutedExpertsManager:
             internal_only,
         )
 
-    def store_batch(self, data: np.ndarray, slot_mapping: np.ndarray) -> None:
+    def store_batch(
+        self,
+        data: np.ndarray,
+        weight_data: np.ndarray | None = None,
+        slot_mapping: np.ndarray | None = None,
+    ) -> None:
         """Persist one step's routed experts into the slot buffer.
 
         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
         indexing handles repeated / out-of-order indices. Called once
         per scheduler step in ``update_from_output``.
 
-        If a ``stats_collector`` is attached, the raw ``data`` is also
-        forwarded to it for global aggregation.
+        If a ``stats_collector`` is attached, the raw ``data`` (and
+        ``weight_data`` when provided) is also forwarded to it for global
+        aggregation.
         """
         self.routed_experts_by_slot[slot_mapping] = data
+        if (
+            weight_data is not None
+            and self.routed_experts_weights_by_slot is not None
+        ):
+            self.routed_experts_weights_by_slot[slot_mapping] = weight_data
         if self.stats_collector is not None:
-            self.stats_collector.record_batch(data, slot_mapping)
+            self.stats_collector.record_batch(
+                data, weight_data, slot_mapping
+            )
 
     def get(
         self,

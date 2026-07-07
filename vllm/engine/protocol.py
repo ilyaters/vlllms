@@ -278,3 +278,34 @@ class EngineClient(ABC):
         No-op if stats collection is not enabled at startup.
         """
         raise NotImplementedError
+
+    async def set_riy_mask(
+        self, pruned_experts: list[list[int]]
+    ) -> None:
+        """Set the runtime expert mask (reversible, no VRAM savings).
+
+        ``pruned_experts`` is a list of ``[layer_idx, expert_idx]`` pairs
+        whose routing weights should be zeroed+renormalized at runtime.
+        Replaces any previously-set mask. No-op if runtime masking is not
+        enabled (``enable_routed_experts_mask`` off).
+        """
+        raise NotImplementedError
+
+    async def get_riy_mask(self) -> list[list[int]]:
+        """Return the current runtime expert mask as ``[layer, expert]`` pairs."""
+        raise NotImplementedError
+
+    async def clear_riy_mask(self) -> None:
+        """Clear the runtime expert mask (allow every expert)."""
+        raise NotImplementedError
+
+    async def load_riy_profile(self, path: str) -> dict:
+        """Load a RIY profile JSON and apply load-time pruning.
+
+        Returns a summary dict (e.g. ``{"pruned_experts": [[l,e],...]}``).
+        NOTE: load-time pruning compacts the expert map; applying it after
+        startup re-allocates expert weights and is only supported on
+        configurations that allow it (modular kernels with expert_map
+        support, EP=1, no fused shared experts).
+        """
+        raise NotImplementedError
