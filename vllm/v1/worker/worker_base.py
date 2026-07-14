@@ -179,6 +179,19 @@ class WorkerBase:
         """Get vocabulary size from model configuration."""
         return self.model_config.get_vocab_size()
 
+    def get_memory_report(self) -> dict[str, Any]:
+        """Return a dict of per-worker memory metrics for the post-init
+        memory report.
+
+        Subclasses should override this to provide platform-specific data.
+        The base implementation returns an empty report.
+        """
+        return {
+            "rank": getattr(self, "rank", -1),
+            "local_rank": getattr(self, "local_rank", -1),
+            "error": "get_memory_report not implemented for this worker type",
+        }
+
     def shutdown(self) -> None:
         """Clean up resources held by the worker."""
         return

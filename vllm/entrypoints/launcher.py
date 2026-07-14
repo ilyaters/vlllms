@@ -34,6 +34,19 @@ async def serve_http(
     options.  Supports http header limits via h11_max_incomplete_event_size and
     h11_max_header_count.
     """
+    # Log detailed memory consumption report after model initialization is
+    # complete and immediately before listing the HTTP API endpoints.
+    # At this point all GPU resources (weights, KV cache, CUDA context,
+    # CUDA graphs, NCCL buffers) are fully allocated.
+    engine_client = getattr(app.state, "engine_client", None)
+    if engine_client is not None:
+        try:
+            from vllm.v1.memory_report import log_memory_report
+
+            await log_memory_report(engine_client)
+        except Exception:
+            logger.exception("Failed to generate memory consumption report")
+
     logger.info("Available routes are:")
     # post endpoints
     for route in app.routes:

@@ -772,6 +772,8 @@ class Worker(WorkerBase):
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        # Store the actual (measured) CUDA graph memory for the memory report.
+        self.cuda_graph_memory_bytes = cuda_graph_memory_bytes
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -919,6 +921,111 @@ class Worker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+
+    def get_memory_report(self) -> dict[str, Any]:
+        """Collect per-GPU memory data from this worker process.
+
+        Gathers NVML VRAM stats, PyTorch CUDA allocator stats, and vLLM
+        internal memory metrics (weights, KV cache, activations, etc.).
+
+        Called via ``collective_rpc`` from the API server process.
+        """
+        from vllm.v1.memory_report import collect_worker_memory_report
+
+        # Start with the base collection (NVML + PyTorch allocator)
+        report = collect_worker_memory_report()
+
+        # Enrich with vLLM-internal metrics only available on the Worker
+        report["weights_memory"] = getattr(
+            self.model_runner, "model_memory_usage", None
+        )
+        report["kv_cache_memory"] = getattr(
+            self, "available_kv_cache_memory_bytes", None
+        )
+        report["peak_activation_memory"] = getattr(
+            self, "peak_activation_memory", None
+        )
+        report["non_torch_memory"] = getattr(self, "non_torch_memory", None)
+        # Actual (measured) CUDA graph memory from capture_model()
+        report["cuda_graph_memory"] = getattr(
+            self, "cuda_graph_memory_bytes", None
+        )
+        # Pre-capture estimate (from profile_cudagraph_memory)
+        report["cudagraph_memory_estimate"] = getattr(
+            self, "cudagraph_memory_estimate", None
+        )
+        init_snapshot = getattr(self, "init_snapshot", None)
+        report["init_free_memory"] = (
+            init_snapshot.free_memory if init_snapshot is not None else None
+        )
+        report["init_total_memory"] = (
+            init_snapshot.total_memory if init_snapshot is not None else None
+        )
+        report["requested_memory"] = getattr(self, "requested_memory", None)
+
+        # --- Breakdown of non-torch memory ---
+        # non_torch_memory = total GPU used - torch reserved.
+        # This includes CUDA Context, NCCL buffers, custom all-reduce
+        # buffers, workspace, and other non-PyTorch allocations.
+        # We try to get individual values where possible.
+        non_torch = report.get("non_torch_memory") or 0
+
+        # Workspace memory (from WorkspaceManager)
+        workspace_bytes = 0
+        try:
+            from vllm.v1.worker.workspace import _manager
+
+            if _manager is not None:
+                for ws in _manager._current_workspaces:
+                    if ws is not None:
+                        workspace_bytes += ws.numel() * ws.element_size()
+        except Exception:
+            pass
+        report["workspace_memory"] = workspace_bytes
+
+        # Custom all-reduce buffer memory
+        custom_ar_bytes = 0
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            device_comm = tp_group.device_communicator
+            if (
+                device_comm is not None
+                and hasattr(device_comm, "ca_comm")
+                and device_comm.ca_comm is not None
+            ):
+                ca_comm = device_comm.ca_comm
+                if hasattr(ca_comm, "max_size"):
+                    custom_ar_bytes = ca_comm.max_size
+        except Exception:
+            pass
+        report["custom_allreduce_memory"] = custom_ar_bytes
+
+        # NCCL symmetric memory pool (if enabled)
+        nccl_symm_bytes = 0
+        try:
+            from vllm.distributed.device_communicators.pynccl_allocator import (
+                _cached_pool_snapshot,
+            )
+
+            if _cached_pool_snapshot is not None:
+                for segment in _cached_pool_snapshot:
+                    nccl_symm_bytes += segment.get("total_size", 0)
+        except Exception:
+            pass
+        report["nccl_symmetric_memory"] = nccl_symm_bytes
+
+        # The remainder of non_torch_memory that we cannot attribute to a
+        # specific category. This includes CUDA Context, NCCL internal
+        # buffers (not in the symmetric pool), and other driver/runtime
+        # overhead.
+        attributed = (
+            workspace_bytes + custom_ar_bytes + nccl_symm_bytes
+        )
+        report["non_torch_unattributed"] = max(0, non_torch - attributed)
+
+        return report
 
     def get_compilation_match_table(self) -> dict[str, int]:
         from vllm.compilation.passes.vllm_inductor_pass import get_match_table
