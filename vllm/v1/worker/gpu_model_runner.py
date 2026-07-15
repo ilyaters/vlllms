@@ -7523,7 +7523,7 @@ class GPUModelRunner(
                 wbuf.shape,
                 dtype=wbuf.dtype,
                 device="cpu",
-                pin_memory=self.pin_memory,
+                pin_memory=PIN_MEMORY,
             )
         else:
             self.routed_experts_weights_cpu = None

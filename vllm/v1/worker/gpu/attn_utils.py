@@ -248,6 +248,25 @@ def _reshape_attention_kv_cache(
         )
     else:
         # No padding — safe to use a contiguous view.
+        # Validate that the raw tensor has exactly the right number of
+        # elements for the requested shape. The raw tensor is allocated as
+        # int8 and then reinterpreted as ``dtype``, so the element count must
+        # account for the dtype size. This catches mismatches between the
+        # allocation (page_size_bytes) and the reshape shape
+        # (get_kv_cache_shape) early, with an actionable message instead of an
+        # opaque RuntimeError from torch.view().
+        expected_numel = prod(permuted_kv_cache_shape) * get_dtype_size(dtype)
+        assert kv_raw_tensor.numel() == expected_numel, (
+            f"KV cache shape mismatch: raw tensor has {kv_raw_tensor.numel()} "
+            f"elements (int8), but the requested shape "
+            f"{permuted_kv_cache_shape} with dtype {dtype} (size "
+            f"{get_dtype_size(dtype)}) requires {expected_numel} elements. "
+            f"This usually means the KV cache allocation (page_size_bytes) "
+            f"and the reshape shape (get_kv_cache_shape) disagree on the "
+            f"per-token byte count. Check that cache_dtype_str is propagated "
+            f"correctly to get_kv_cache_shape() for the quantized KV cache "
+            f"format (e.g. fp8_ds_mla uses a 656-byte layout, not head_size)."
+        )
         kv_cache = kv_raw_tensor.view(dtype).view(permuted_kv_cache_shape)
 
     return kv_cache.permute(*inv_order)
@@ -313,7 +332,8 @@ def _reshape_kv_cache(
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
-                    else cache_dtype
+                    else getattr(kv_cache_spec, "cache_dtype_str", None)
+                    or cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,

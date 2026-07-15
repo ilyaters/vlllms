@@ -33,7 +33,12 @@ except ImportError:
 
 try:
     from torchcodec.decoders import VideoDecoder
-except ImportError:
+except (ImportError, OSError):
+    # Catch OSError too: an ABI-incompatible torchcodec build (e.g. built
+    # against a different PyTorch/CUDA version) raises OSError with messages
+    # like "undefined symbol" when loading the native library, rather than a
+    # clean ImportError. Without this, a broken torchcodec in the image would
+    # crash the entire vLLM process at import time.
     VideoDecoder = PlaceholderModule("torchcodec").placeholder_attr(  # type: ignore[assignment]
         "decoders.VideoDecoder"
     )

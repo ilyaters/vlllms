@@ -30,7 +30,10 @@ try:
     from torchcodec.decoders import AudioDecoder
 
     _HAS_TORCHCODEC = True
-except ImportError:
+except (ImportError, OSError):
+    # Catch OSError too: an ABI-incompatible torchcodec build raises OSError
+    # (e.g. "undefined symbol") rather than ImportError when loading native
+    # libraries. See video.py for the same pattern.
     AudioDecoder = None
     _HAS_TORCHCODEC = False
 
