@@ -30,10 +30,13 @@ try:
     from torchcodec.decoders import AudioDecoder
 
     _HAS_TORCHCODEC = True
-except (ImportError, OSError):
-    # Catch OSError too: an ABI-incompatible torchcodec build raises OSError
-    # (e.g. "undefined symbol") rather than ImportError when loading native
-    # libraries. See video.py for the same pattern.
+except (ImportError, OSError, RuntimeError):
+    # Catch OSError and RuntimeError too: an ABI-incompatible or
+    # FFmpeg-missing torchcodec build raises RuntimeError (wrapped from
+    # OSError) via load_torchcodec_shared_libraries(), rather than a clean
+    # ImportError. Without this, a broken torchcodec in the image would
+    # crash the entire vLLM process at import time. See video.py for the
+    # same pattern.
     AudioDecoder = None
     _HAS_TORCHCODEC = False
 

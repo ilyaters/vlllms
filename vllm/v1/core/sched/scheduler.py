@@ -317,6 +317,12 @@ class Scheduler(SchedulerInterface):
             vllm_config.model_config.enable_routed_experts_stats
         )
 
+        # Defaults so that update_from_output and other methods can safely
+        # check ``self.routed_experts_mgr is not None`` even when neither
+        # routed-experts return nor stats collection is enabled.
+        self.routed_experts_mgr: RoutedExpertsManager | None = None
+        self._re_block_ids: dict[str, list[int]] = {}
+
         # The routed-experts manager is needed whenever we either
         # return per-request routing data to the client OR accumulate
         # global stats. The ``internal_only`` flag suppresses the

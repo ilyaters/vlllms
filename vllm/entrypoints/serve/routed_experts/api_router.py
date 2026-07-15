@@ -133,11 +133,31 @@ async def enable_routed_experts_stats(raw_request: Request):
     )
 
 
+def _riy_not_enabled_response() -> JSONResponse:
+    """503 response for when RIY runtime masking is not initialized."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "code": "riy_not_initialized",
+                "message": (
+                    "RIY runtime masking is not initialized. Start the "
+                    "server with --enable-routed-experts-mask (or "
+                    "--enable-routed-experts-stats / --riy-expert-profile)."
+                ),
+            }
+        },
+    )
+
+
 @router.get("/v1/routed-experts/mask")
 async def get_riy_mask(raw_request: Request):
     """Return the current runtime expert mask as [layer, expert] pairs."""
     client = engine_client(raw_request)
-    mask = await client.get_riy_mask()
+    try:
+        mask = await client.get_riy_mask()
+    except Exception:
+        return _riy_not_enabled_response()
     return JSONResponse(content={"pruned_experts": mask})
 
 
@@ -145,7 +165,10 @@ async def get_riy_mask(raw_request: Request):
 async def set_riy_mask(raw_request: Request, body: RiyMaskRequest):
     """Set the runtime expert mask (reversible, no VRAM savings)."""
     client = engine_client(raw_request)
-    await client.set_riy_mask(body.pruned_experts)
+    try:
+        await client.set_riy_mask(body.pruned_experts)
+    except Exception:
+        return _riy_not_enabled_response()
     return JSONResponse(
         content={
             "status": "ok",
@@ -158,7 +181,10 @@ async def set_riy_mask(raw_request: Request, body: RiyMaskRequest):
 async def clear_riy_mask(raw_request: Request):
     """Clear the runtime expert mask (allow every expert)."""
     client = engine_client(raw_request)
-    await client.clear_riy_mask()
+    try:
+        await client.clear_riy_mask()
+    except Exception:
+        return _riy_not_enabled_response()
     return JSONResponse(content={"status": "ok", "pruned_experts": []})
 
 
@@ -171,7 +197,10 @@ async def load_riy_profile(raw_request: Request, body: RiyProfileLoadRequest):
     applies the profile as a reversible runtime mask.
     """
     client = engine_client(raw_request)
-    profile = await client.load_riy_profile(body.path)
+    try:
+        profile = await client.load_riy_profile(body.path)
+    except Exception:
+        return _riy_not_enabled_response()
     return JSONResponse(content={"status": "ok", "profile": profile})
 
 
